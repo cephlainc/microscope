@@ -1,6 +1,6 @@
 # Cephla microscopes (Squid and Octopi)
 
-![alt text](https://i.imgur.com/Gjwh02y.png)
+![alt text](https://i.imgur.com/4T1yuvB.jpg)
 
 ## Introduction
 Squid (Simplifying Quantitive Imaging Development and Deployment) provides a full suite of hardware and software components for rapidly configuring high-performance microscopes tailored to users' applications with reduced cost, effort and turnaround time. Besides increasing accessibility of research microscopes and available microscope hours to labs, it is also designed to simplify development and dissemination of new or otherwise advanced microscopy techniques.
