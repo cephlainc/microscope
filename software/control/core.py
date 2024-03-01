@@ -8,8 +8,11 @@ from qtpy.QtCore import *
 from qtpy.QtWidgets import *
 from qtpy.QtGui import *
 
+from control.processing_handler import ProcessingHandler
+
 import control.utils as utils
 from control._def import *
+
 import control.tracking as tracking
 try:
     from control.multipoint_custom_script_entry import *
@@ -36,6 +39,14 @@ import json
 import pandas as pd
 
 import imageio as iio
+
+import subprocess
+
+class ObjectiveStore:
+    def __init__(self, objectives_dict = OBJECTIVES, default_objective = DEFAULT_OBJECTIVE):
+        self.objectives_dict = objectives_dict
+        self.default_objective = default_objective
+        self.current_objective = default_objective
 
 class StreamHandler(QObject):
 
@@ -84,7 +95,7 @@ class StreamHandler(QObject):
     def set_save_fps(self,fps):
         self.fps_save = fps
 
-    def set_crop(self,crop_width,height):
+    def set_crop(self,crop_width,crop_height):
         self.crop_width = crop_width
         self.crop_height = crop_height
 
@@ -359,7 +370,7 @@ class ImageDisplay(QObject):
         self.thread.join()
 
 class Configuration:
-    def __init__(self,mode_id=None,name=None,camera_sn=None,exposure_time=None,analog_gain=None,illumination_source=None,illumination_intensity=None):
+    def __init__(self,mode_id=None,name=None,camera_sn=None,exposure_time=None,analog_gain=None,illumination_source=None,illumination_intensity=None, z_offset=None, pixel_format=None, _pixel_format_options=None):
         self.id = mode_id
         self.name = name
         self.exposure_time = exposure_time
@@ -367,6 +378,13 @@ class Configuration:
         self.illumination_source = illumination_source
         self.illumination_intensity = illumination_intensity
         self.camera_sn = camera_sn
+        self.z_offset = z_offset
+        self.pixel_format = pixel_format
+        if self.pixel_format is None:
+            self.pixel_format = "default"
+        self._pixel_format_options = _pixel_format_options
+        if _pixel_format_options is None:
+            self._pixel_format_options = self.pixel_format
 
 class LiveController(QObject):
 
@@ -428,6 +446,8 @@ class LiveController(QObject):
         if self.is_live:
             self.is_live = False
             self.camera.is_live = False
+            if hasattr(self.camera,'stop_exposure'):
+                self.camera.stop_exposure()
             if self.trigger_mode == TriggerMode.SOFTWARE:
                 self._stop_triggerred_acquisition()
             # self.camera.stop_streaming() # 20210113 this line seems to cause problems when using af with multipoint
@@ -546,9 +566,12 @@ class NavigationController(QObject):
     xyPos = Signal(float,float)
     signal_joystick_button_pressed = Signal()
 
-    def __init__(self,microcontroller):
+    def __init__(self,microcontroller, parent=None):
+        # parent should be set to OctopiGUI instance to enable updates
+        # to camera settings, e.g. binning, that would affect click-to-move
         QObject.__init__(self)
         self.microcontroller = microcontroller
+        self.parent = parent
         self.x_pos_mm = 0
         self.y_pos_mm = 0
         self.z_pos_mm = 0
@@ -557,6 +580,7 @@ class NavigationController(QObject):
         self.x_microstepping = MICROSTEPPING_DEFAULT_X
         self.y_microstepping = MICROSTEPPING_DEFAULT_Y
         self.z_microstepping = MICROSTEPPING_DEFAULT_Z
+        self.click_to_move = False
         self.theta_microstepping = MICROSTEPPING_DEFAULT_THETA
         self.enable_joystick_button_action = True
 
@@ -567,6 +591,76 @@ class NavigationController(QObject):
         # self.timer_read_pos.setInterval(PosUpdate.INTERVAL_MS)
         # self.timer_read_pos.timeout.connect(self.update_pos)
         # self.timer_read_pos.start()
+
+    def set_flag_click_to_move(self, flag):
+        self.click_to_move = flag
+
+    def move_from_click(self, click_x, click_y):
+        if self.click_to_move:
+            try:
+                highest_res = (0,0)
+                for res in self.parent.camera.res_list:
+                    if res[0] > highest_res[0] or res[1] > higest_res[1]:
+                        highest_res = res
+                resolution = self.parent.camera.resolution
+
+                try:
+                    pixel_binning_x = highest_res[0]/resolution[0]
+                    pixel_binning_y = highest_res[1]/resolution[1]
+                    if pixel_binning_x < 1:
+                        pixel_binning_x = 1
+                    if pixel_binning_y < 1:
+                        pixel_binning_y = 1
+                except:
+                    pixel_binning_x=1
+                    pixel_binning_y=1
+            except AttributeError:
+                pixel_binning_x = 1
+                pixel_binning_y = 1
+
+            try:
+                current_objective = self.parent.objectiveStore.current_objective
+                objective_info = self.parent.objectiveStore.objectives_dict.get(current_objective, {})
+            except (AttributeError, KeyError):
+                objective_info = OBJECTIVES[DEFAULT_OBJECTIVE]
+            magnification = objective_info["magnification"]
+            objective_tube_lens_mm = objective_info["tube_lens_f_mm"]
+            tube_lens_mm = TUBE_LENS_MM
+            pixel_size_um = CAMERA_PIXEL_SIZE_UM[CAMERA_SENSOR]
+
+            pixel_size_xy = pixel_size_um/(magnification/(objective_tube_lens_mm/tube_lens_mm))
+
+            pixel_size_x = pixel_size_xy*pixel_binning_x
+            pixel_size_y = pixel_size_xy*pixel_binning_y
+
+            pixel_sign_x = 1
+            pixel_sign_y = 1 if INVERTED_OBJECTIVE else -1
+
+            delta_x = pixel_sign_x*pixel_size_x*click_x/1000.0
+            delta_y = pixel_sign_y*pixel_size_y*click_y/1000.0
+
+            self.move_x(delta_x)
+            self.move_y(delta_y)
+    def move_to_cached_position(self):
+        if not os.path.isfile("cache/last_coords.txt"):
+            return
+        with open("cache/last_coords.txt","r") as f:
+            for line in f:
+                try:
+                    x,y,z = line.strip("\n").strip().split(",")
+                    x = float(x)
+                    y = float(y)
+                    z = float(z)
+                    self.move_to(x,y)
+                    self.move_z_to(z)
+                    break
+                except:
+                    pass
+                break
+
+    def cache_current_position(self):
+        with open("cache/last_coords.txt","w") as f:
+            f.write(",".join([str(self.x_pos_mm),str(self.y_pos_mm),str(self.z_pos_mm)]))
 
     def move_x(self,delta):
         self.microcontroller.move_x_usteps(int(delta/(SCREW_PITCH_X_MM/(self.x_microstepping*FULLSTEPS_PER_REV_X))))
@@ -726,38 +820,90 @@ class SlidePositionControlWorker(QObject):
         was_live = self.liveController.is_live
         if was_live:
             self.signal_stop_live.emit()
-        if self.slidePositionController.homing_done == False or SLIDE_POTISION_SWITCHING_HOME_EVERYTIME:
-            if self.home_x_and_y_separately:
+
+        # retract z
+        timestamp_start = time.time()
+        self.slidePositionController.z_pos = self.navigationController.z_pos # zpos at the beginning of the scan
+        self.navigationController.move_z_to(OBJECTIVE_RETRACTED_POS_MM)
+        self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+        print('z retracted')
+        self.slidePositionController.objective_retracted = True
+        
+        # move to position
+        # for well plate
+        if self.slidePositionController.is_for_wellplate:
+            # reset limits
+            self.navigationController.set_x_limit_pos_mm(100)
+            self.navigationController.set_x_limit_neg_mm(-100)
+            self.navigationController.set_y_limit_pos_mm(100)
+            self.navigationController.set_y_limit_neg_mm(-100)
+            # home for the first time
+            if self.slidePositionController.homing_done == False:
+                print('running homing first')
                 timestamp_start = time.time()
-                self.navigationController.home_x()
+                # x needs to be at > + 20 mm when homing y
+                self.navigationController.move_x(20)
                 self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
-                self.navigationController.zero_x()
-                self.navigationController.move_x(SLIDE_POSITION.LOADING_X_MM)
-                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                # home y
                 self.navigationController.home_y()
                 self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
                 self.navigationController.zero_y()
-                self.navigationController.move_y(SLIDE_POSITION.LOADING_Y_MM)
-                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
-            else:
-                timestamp_start = time.time()
-                self.navigationController.home_xy()
+                # home x
+                self.navigationController.home_x()
                 self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
                 self.navigationController.zero_x()
-                self.navigationController.zero_y()
-                self.navigationController.move_x(SLIDE_POSITION.LOADING_X_MM)
+                self.slidePositionController.homing_done = True
+            # homing done previously
+            else:
+                timestamp_start = time.time()
+                self.navigationController.move_x_to(20)
                 self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
-                self.navigationController.move_y(SLIDE_POSITION.LOADING_Y_MM)
+                self.navigationController.move_y_to(SLIDE_POSITION.LOADING_Y_MM)
                 self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
-            self.slidePositionController.homing_done = True
+                self.navigationController.move_x_to(SLIDE_POSITION.LOADING_X_MM)
+                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+            # set limits again
+            self.navigationController.set_x_limit_pos_mm(SOFTWARE_POS_LIMIT.X_POSITIVE)
+            self.navigationController.set_x_limit_neg_mm(SOFTWARE_POS_LIMIT.X_NEGATIVE)
+            self.navigationController.set_y_limit_pos_mm(SOFTWARE_POS_LIMIT.Y_POSITIVE)
+            self.navigationController.set_y_limit_neg_mm(SOFTWARE_POS_LIMIT.Y_NEGATIVE)
         else:
-            timestamp_start = time.time()
-            self.navigationController.move_y(SLIDE_POSITION.LOADING_Y_MM-self.navigationController.y_pos_mm)
-            self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
-            self.navigationController.move_x(SLIDE_POSITION.LOADING_X_MM-self.navigationController.x_pos_mm)
-            self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+
+            # for glass slide
+            if self.slidePositionController.homing_done == False or SLIDE_POTISION_SWITCHING_HOME_EVERYTIME:
+                if self.home_x_and_y_separately:
+                    timestamp_start = time.time()
+                    self.navigationController.home_x()
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                    self.navigationController.zero_x()
+                    self.navigationController.move_x(SLIDE_POSITION.LOADING_X_MM)
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                    self.navigationController.home_y()
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                    self.navigationController.zero_y()
+                    self.navigationController.move_y(SLIDE_POSITION.LOADING_Y_MM)
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                else:
+                    timestamp_start = time.time()
+                    self.navigationController.home_xy()
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                    self.navigationController.zero_x()
+                    self.navigationController.zero_y()
+                    self.navigationController.move_x(SLIDE_POSITION.LOADING_X_MM)
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                    self.navigationController.move_y(SLIDE_POSITION.LOADING_Y_MM)
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                self.slidePositionController.homing_done = True
+            else:
+                timestamp_start = time.time()
+                self.navigationController.move_y(SLIDE_POSITION.LOADING_Y_MM-self.navigationController.y_pos_mm)
+                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                self.navigationController.move_x(SLIDE_POSITION.LOADING_X_MM-self.navigationController.x_pos_mm)
+                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+
         if was_live:
             self.signal_resume_live.emit()
+
         self.slidePositionController.slide_loading_position_reached = True
         self.finished.emit()
 
@@ -765,38 +911,84 @@ class SlidePositionControlWorker(QObject):
         was_live = self.liveController.is_live
         if was_live:
             self.signal_stop_live.emit()
-        if self.slidePositionController.homing_done == False or SLIDE_POTISION_SWITCHING_HOME_EVERYTIME:
-            if self.home_x_and_y_separately:
+
+        # move to position
+        # for well plate
+        if self.slidePositionController.is_for_wellplate:
+            # home for the first time
+            if self.slidePositionController.homing_done == False:
                 timestamp_start = time.time()
+
+                # x needs to be at > + 20 mm when homing y
+                self.navigationController.move_x(20)
+                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                # home y
                 self.navigationController.home_y()
                 self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
                 self.navigationController.zero_y()
-                self.navigationController.move_y(SLIDE_POSITION.SCANNING_Y_MM)
-                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                # home x
                 self.navigationController.home_x()
                 self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
                 self.navigationController.zero_x()
-                self.navigationController.move_x(SLIDE_POSITION.SCANNING_X_MM)
+                self.slidePositionController.homing_done = True
+                # move to scanning position
+                self.navigationController.move_x_to(SLIDE_POSITION.SCANNING_X_MM)
                 self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+
+                self.navigationController.move_y_to(SLIDE_POSITION.SCANNING_Y_MM)
+                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                   
             else:
                 timestamp_start = time.time()
-                self.navigationController.home_xy()
+                self.navigationController.move_x_to(SLIDE_POSITION.SCANNING_X_MM)
                 self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
-                self.navigationController.zero_x()
-                self.navigationController.zero_y()
-                self.navigationController.move_y(SLIDE_POSITION.SCANNING_Y_MM)
+                self.navigationController.move_y_to(SLIDE_POSITION.SCANNING_Y_MM)
                 self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
-                self.navigationController.move_x(SLIDE_POSITION.SCANNING_X_MM)
-                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
-            self.slidePositionController.homing_done = True
         else:
-            timestamp_start = time.time()
-            self.navigationController.move_y(SLIDE_POSITION.SCANNING_Y_MM-self.navigationController.y_pos_mm)
+            if self.slidePositionController.homing_done == False or SLIDE_POTISION_SWITCHING_HOME_EVERYTIME:
+                if self.home_x_and_y_separately:
+                    timestamp_start = time.time()
+                    self.navigationController.home_y()
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                    self.navigationController.zero_y()
+                    self.navigationController.move_y(SLIDE_POSITION.SCANNING_Y_MM)
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                    self.navigationController.home_x()
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                    self.navigationController.zero_x()
+                    self.navigationController.move_x(SLIDE_POSITION.SCANNING_X_MM)
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                else:
+                    timestamp_start = time.time()
+                    self.navigationController.home_xy()
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                    self.navigationController.zero_x()
+                    self.navigationController.zero_y()
+                    self.navigationController.move_y(SLIDE_POSITION.SCANNING_Y_MM)
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                    self.navigationController.move_x(SLIDE_POSITION.SCANNING_X_MM)
+                    self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                self.slidePositionController.homing_done = True
+            else:
+                timestamp_start = time.time()
+                self.navigationController.move_y(SLIDE_POSITION.SCANNING_Y_MM-self.navigationController.y_pos_mm)
+                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+                self.navigationController.move_x(SLIDE_POSITION.SCANNING_X_MM-self.navigationController.x_pos_mm)
+                self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+
+        # restore z
+        if self.slidePositionController.objective_retracted:
+            _usteps_to_clear_backlash = max(160,20*self.navigationController.z_microstepping)
+            self.navigationController.microcontroller.move_z_to_usteps(self.slidePositionController.z_pos - STAGE_MOVEMENT_SIGN_Z*_usteps_to_clear_backlash)
             self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
-            self.navigationController.move_x(SLIDE_POSITION.SCANNING_X_MM-self.navigationController.x_pos_mm)
+            self.navigationController.move_z_usteps(_usteps_to_clear_backlash)
             self.wait_till_operation_is_completed(timestamp_start, SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S)
+            self.slidePositionController.objective_retracted = False
+            print('z position restored')
+        
         if was_live:
             self.signal_resume_live.emit()
+
         self.slidePositionController.slide_scanning_position_reached = True
         self.finished.emit()
 
@@ -806,13 +998,17 @@ class SlidePositionController(QObject):
     signal_slide_scanning_position_reached = Signal()
     signal_clear_slide = Signal()
 
-    def __init__(self,navigationController,liveController):
+    def __init__(self,navigationController,liveController,is_for_wellplate=False):
         QObject.__init__(self)
         self.navigationController = navigationController
         self.liveController = liveController
         self.slide_loading_position_reached = False
         self.slide_scanning_position_reached = False
         self.homing_done = False
+        self.is_for_wellplate = is_for_wellplate
+        self.retract_objective_before_moving = RETRACT_OBJECTIVE_BEFORE_MOVING_TO_LOADING_POSITION
+        self.objective_retracted = False
+        self.thread = None
 
     def move_to_slide_loading_position(self):
         # create a QThread object
@@ -829,11 +1025,12 @@ class SlidePositionController(QObject):
         self.slidePositionControlWorker.finished.connect(self.slidePositionControlWorker.deleteLater)
         self.slidePositionControlWorker.finished.connect(self.thread.quit)
         self.thread.finished.connect(self.thread.quit)
+        # self.slidePositionControlWorker.finished.connect(self.threadFinished,type=Qt.BlockingQueuedConnection)
         # start the thread
         self.thread.start()
 
     def move_to_slide_scanning_position(self):
-        # create a QThread object
+    	# create a QThread object
         self.thread = QThread()
         # create a worker object
         self.slidePositionControlWorker = SlidePositionControlWorker(self)
@@ -847,7 +1044,9 @@ class SlidePositionController(QObject):
         self.slidePositionControlWorker.finished.connect(self.slidePositionControlWorker.deleteLater)
         self.slidePositionControlWorker.finished.connect(self.thread.quit)
         self.thread.finished.connect(self.thread.quit)
+        # self.slidePositionControlWorker.finished.connect(self.threadFinished,type=Qt.BlockingQueuedConnection)
         # start the thread
+        print('before thread.start()')
         self.thread.start()
         self.signal_clear_slide.emit()
 
@@ -856,6 +1055,9 @@ class SlidePositionController(QObject):
 
     def slot_resume_live(self):
         self.liveController.start_live()
+
+    # def threadFinished(self):
+    # 	print('========= threadFinished ========= ')
 
 class AutofocusWorker(QObject):
 
@@ -925,6 +1127,7 @@ class AutofocusWorker(QObject):
             if self.liveController.trigger_mode == TriggerMode.SOFTWARE:
                 self.liveController.turn_off_illumination()
             image = utils.crop_image(image,self.crop_width,self.crop_height)
+            image = utils.rotate_and_flip_image(image,rotate_image_angle=self.camera.rotate_image_angle,flip_image=self.camera.flip_image)
             self.image_to_display.emit(image)
             QApplication.processEvents()
             timestamp_0 = time.time()
@@ -974,6 +1177,8 @@ class AutoFocusController(QObject):
         self.crop_width = AF.CROP_WIDTH
         self.crop_height = AF.CROP_HEIGHT
         self.autofocus_in_progress = False
+        self.focus_map_coords = []
+        self.use_focus_map = False
 
     def set_N(self,N):
         self.N = N
@@ -983,11 +1188,25 @@ class AutoFocusController(QObject):
         self.deltaZ = deltaZ_um/1000
         self.deltaZ_usteps = round((deltaZ_um/1000)/mm_per_ustep_Z)
 
-    def set_crop(self,crop_width,height):
+    def set_crop(self,crop_width,crop_height):
         self.crop_width = crop_width
         self.crop_height = crop_height
 
-    def autofocus(self):
+    def autofocus(self, focus_map_override=False):
+        if self.use_focus_map and (not focus_map_override):
+            self.autofocus_in_progress = True
+            self.navigationController.microcontroller.wait_till_operation_is_completed()
+            x = self.navigationController.x_pos_mm
+            y = self.navigationController.y_pos_mm
+            
+            # z here is in mm because that's how the navigation controller stores it
+            target_z = utils.interpolate_plane(*self.focus_map_coords[:3], (x,y))
+            print(f"Interpolated target z as {target_z} mm from focus map, moving there.")
+            self.navigationController.move_z_to(target_z)
+            self.navigationController.microcontroller.wait_till_operation_is_completed()
+            self.autofocus_in_progress = False
+            self.autofocusFinished.emit()
+            return
         # stop live
         if self.liveController.is_live:
             self.was_live_before_autofocus = True
@@ -1051,8 +1270,94 @@ class AutoFocusController(QObject):
 
     def wait_till_autofocus_has_completed(self):
         while self.autofocus_in_progress == True:
+            QApplication.processEvents()
             time.sleep(0.005)
         print('autofocus wait has completed, exit wait')
+
+    def set_focus_map_use(self, enable):
+        if not enable:
+            print("Disabling focus map.")
+            self.use_focus_map = False
+            return
+        if len(self.focus_map_coords) < 3:
+            print("Not enough coordinates (less than 3) for focus map generation, disabling focus map.")
+            self.use_focus_map = False
+            return
+        x1,y1,_ = self.focus_map_coords[0]
+        x2,y2,_ = self.focus_map_coords[1]
+        x3,y3,_ = self.focus_map_coords[2]
+
+        detT = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+        if detT == 0:
+            print("Your 3 x-y coordinates are linear, cannot use to interpolate, disabling focus map.")
+            self.use_focus_map = False
+            return
+
+        if enable:
+            print("Enabling focus map.")
+            self.use_focus_map = True
+
+    def clear_focus_map(self):
+        self.focus_map_coords = []
+        self.set_focus_map_use(False)
+
+    def gen_focus_map(self, coord1,coord2,coord3):
+        """
+        Navigate to 3 coordinates and get your focus-map coordinates
+        by autofocusing there and saving the z-values.
+        :param coord1-3: Tuples of (x,y) values, coordinates in mm.
+        :raise: ValueError if coordinates are all on the same line
+        """
+        x1,y1 = coord1
+        x2,y2 = coord2
+        x3,y3 = coord3
+        detT = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+        if detT == 0:
+            raise ValueError("Your 3 x-y coordinates are linear")
+        
+        self.focus_map_coords = []
+
+        for coord in [coord1,coord2,coord3]:
+            print(f"Navigating to coordinates ({coord[0]},{coord[1]}) to sample for focus map")
+            self.navigationController.move_to(coord[0],coord[1])
+            self.navigationController.microcontroller.wait_till_operation_is_completed()
+            print("Autofocusing")
+            self.autofocus(True)
+            self.wait_till_autofocus_has_completed()
+            #self.navigationController.microcontroller.wait_till_operation_is_completed()
+            x = self.navigationController.x_pos_mm
+            y = self.navigationController.y_pos_mm
+            z = self.navigationController.z_pos_mm
+            print(f"Adding coordinates ({x},{y},{z}) to focus map")
+            self.focus_map_coords.append((x,y,z))
+
+        print("Generated focus map.")
+
+    def add_current_coords_to_focus_map(self):
+        if len(self.focus_map_coords) >= 3:
+            print("Replacing last coordinate on focus map.")
+        self.navigationController.microcontroller.wait_till_operation_is_completed()
+        print("Autofocusing")
+        self.autofocus(True)
+        self.wait_till_autofocus_has_completed()
+        #self.navigationController.microcontroller.wait_till_operation_is_completed()
+        x = self.navigationController.x_pos_mm
+        y = self.navigationController.y_pos_mm
+        z = self.navigationController.z_pos_mm
+        if len(self.focus_map_coords) >= 2:
+            x1,y1,_ = self.focus_map_coords[0]
+            x2,y2,_ = self.focus_map_coords[1]
+            x3 = x
+            y3 = y
+
+            detT = (y2-y3) * (x1-x3) + (x3-x2) * (y1-y3)
+            if detT == 0:
+                raise ValueError("Your 3 x-y coordinates are linear. Navigate to a different coordinate or clear and try again.")
+        if len(self.focus_map_coords) >= 3:
+            self.focus_map_coords.pop()
+        self.focus_map_coords.append((x,y,z))
+        print(f"Added triple ({x},{y},{z}) to focus map")
+
 
 class MultiPointWorker(QObject):
 
@@ -1062,11 +1367,17 @@ class MultiPointWorker(QObject):
     image_to_display_multi = Signal(np.ndarray,int)
     signal_current_configuration = Signal(Configuration)
     signal_register_current_fov = Signal(float,float)
+    signal_detection_stats = Signal(object)
+
+    signal_update_stats = Signal(object)
 
     def __init__(self,multiPointController):
         QObject.__init__(self)
         self.multiPointController = multiPointController
 
+        self.signal_update_stats.connect(self.update_stats)
+        self.start_time = 0
+        self.processingHandler = multiPointController.processingHandler
         self.camera = self.multiPointController.camera
         self.microcontroller = self.multiPointController.microcontroller
         self.usb_spectrometer = self.multiPointController.usb_spectrometer
@@ -1094,14 +1405,33 @@ class MultiPointWorker(QObject):
         self.experiment_ID = self.multiPointController.experiment_ID
         self.base_path = self.multiPointController.base_path
         self.selected_configurations = self.multiPointController.selected_configurations
+        self.detection_stats = {}
+        self.async_detection_stats = {}
 
         self.timestamp_acquisition_started = self.multiPointController.timestamp_acquisition_started
         self.time_point = 0
 
         self.microscope = self.multiPointController.parent
 
+        self.t_dpc = []
+        self.t_inf = []
+        self.t_over=[]
+        
+
+    def update_stats(self, new_stats):
+        for k in new_stats.keys():
+            try:
+                self.detection_stats[k]+=new_stats[k]
+            except:
+                self.detection_stats[k] = 0
+                self.detection_stats[k]+=new_stats[k]
+        if "Total RBC" in self.detection_stats and "Total Positives" in self.detection_stats:
+            self.detection_stats["Positives per 5M RBC"] = 5e6*(self.detection_stats["Total Positives"]/self.detection_stats["Total RBC"])
+        self.signal_detection_stats.emit(self.detection_stats)
+
     def run(self):
 
+        self.start_time = time.perf_counter_ns()
         if self.camera.is_streaming == False:
              self.camera.start_streaming()
 
@@ -1148,6 +1478,10 @@ class MultiPointWorker(QObject):
                     if self.multiPointController.abort_acqusition_requested:
                         break
                     time.sleep(0.05)
+        self.processingHandler.processing_queue.join()
+        self.processingHandler.upload_queue.join()
+        elapsed_time = time.perf_counter_ns()-self.start_time
+        print("Time taken for acquisition/processing: "+str(elapsed_time/10**9))
         self.finished.emit()
 
     def wait_till_operation_is_completed(self):
@@ -1155,11 +1489,10 @@ class MultiPointWorker(QObject):
             time.sleep(SLEEP_TIME_S)
 
     def run_single_time_point(self):
-
+        start = time.time()
+        print(time.time())
         # disable joystick button action
         self.navigationController.enable_joystick_button_action = False
-
-        self.reflection_af_initialized = False
 
         print('multipoint acquisition - time point ' + str(self.time_point+1))
         
@@ -1167,8 +1500,11 @@ class MultiPointWorker(QObject):
         current_path = os.path.join(self.base_path,self.experiment_ID,str(self.time_point))
         os.mkdir(current_path)
 
+        slide_path = os.path.join(self.base_path, self.experiment_ID)
+
+
         # create a dataframe to save coordinates
-        self.coordinates_pd = pd.DataFrame(columns = ['i', 'j', 'k', 'x (mm)', 'y (mm)', 'z (um)'])
+        self.coordinates_pd = pd.DataFrame(columns = ['i', 'j', 'k', 'x (mm)', 'y (mm)', 'z (um)', 'time'])
 
         n_regions = len(self.scan_coordinates_mm)
 
@@ -1209,6 +1545,7 @@ class MultiPointWorker(QObject):
                 # add '_' to the coordinate name
                 coordiante_name = coordiante_name + '_'
 
+
             self.x_scan_direction = 1
             self.dx_usteps = 0 # accumulated x displacement
             self.dy_usteps = 0 # accumulated y displacement
@@ -1243,8 +1580,9 @@ class MultiPointWorker(QObject):
                                 configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
                                 config_AF = next((config for config in self.configurationManager.configurations if config.name == configuration_name_AF))
                                 self.signal_current_configuration.emit(config_AF)
-                                self.autofocusController.autofocus()
-                                self.autofocusController.wait_till_autofocus_has_completed()
+                                if (self.FOV_counter%Acquisition.NUMBER_OF_FOVS_PER_AF==0) or self.autofocusController.use_focus_map:
+                                    self.autofocusController.autofocus()
+                                    self.autofocusController.wait_till_autofocus_has_completed()
                                 # upate z location of scan_coordinates_mm after AF
                                 if len(coordiante_mm) == 3:
                                     self.scan_coordinates_mm[coordinate_id,2] = self.navigationController.z_pos_mm
@@ -1254,12 +1592,11 @@ class MultiPointWorker(QObject):
                                     except:
                                         pass
                         else:
-                            # initialize laser autofocus
-                            if self.reflection_af_initialized==False:
+                            # initialize laser autofocus if it has not been done
+                            if self.microscope.laserAutofocusController.is_initialized==False:
                                 # initialize the reflection AF
                                 self.microscope.laserAutofocusController.initialize_auto()
-                                self.reflection_af_initialized = True
-                                # do contrast AF for the first FOV
+                                # do contrast AF for the first FOV (if contrast AF box is checked)
                                 if self.do_autofocus and ( (self.NZ == 1) or Z_STACKING_CONFIG == 'FROM CENTER' ) :
                                     configuration_name_AF = MULTIPOINT_AUTOFOCUS_CHANNEL
                                     config_AF = next((config for config in self.configurationManager.configurations if config.name == configuration_name_AF))
@@ -1269,8 +1606,14 @@ class MultiPointWorker(QObject):
                                 # set the current plane as reference
                                 self.microscope.laserAutofocusController.set_reference()
                             else:
-                                self.microscope.laserAutofocusController.move_to_target(0)
-                                self.microscope.laserAutofocusController.move_to_target(0) # for stepper in open loop mode, repeat the operation to counter backlash 
+                                try:
+                                    self.microscope.laserAutofocusController.move_to_target(0)
+                                    self.microscope.laserAutofocusController.move_to_target(0) # for stepper in open loop mode, repeat the operation to counter backlash
+                                except:
+                                    file_ID = coordiante_name + str(i) + '_' + str(j if self.x_scan_direction==1 else self.NX-1-j)
+                                    saving_path = os.path.join(current_path, file_ID + '_focus_camera.bmp')
+                                    iio.imwrite(saving_path,self.microscope.laserAutofocusController.image) 
+                                    print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! laser AF failed !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
 
                         if (self.NZ > 1):
                             # move to bottom of the z stack
@@ -1287,13 +1630,28 @@ class MultiPointWorker(QObject):
 
                         # z-stack
                         for k in range(self.NZ):
-
-                            file_ID = coordiante_name + str(i) + '_' + str(j if self.x_scan_direction==1 else self.NX-1-j) + '_' + str(k)
+                            
+                            # Ensure that i/y-indexing is always top to bottom
+                            sgn_i = -1 if self.deltaY >= 0 else 1
+                            if INVERTED_OBJECTIVE:
+                                sgn_i = -sgn_i
+                            sgn_j = self.x_scan_direction if self.deltaX >= 0 else -self.x_scan_direction
+                            file_ID = coordiante_name + str(self.NY-1-i if sgn_i == -1 else i) + '_' + str(j if sgn_j == 1 else self.NX-1-j) + '_' + str(k)
                             # metadata = dict(x = self.navigationController.x_pos_mm, y = self.navigationController.y_pos_mm, z = self.navigationController.z_pos_mm)
                             # metadata = json.dumps(metadata)
 
+
+                            current_round_images = {}
                             # iterate through selected modes
                             for config in self.selected_configurations:
+                                if config.z_offset is not None: # perform z offset for config, assume
+                                                                # z_offset is in um
+                                    if config.z_offset != 0.0:
+                                        print("Moving to Z offset "+str(config.z_offset))
+                                        self.navigationController.move_z(config.z_offset/1000)
+                                        self.wait_till_operation_is_completed()
+                                        time.sleep(SCAN_STABILIZATION_TIME_MS_Z/1000)
+
                                 if 'USB Spectrometer' not in config.name:
                                     # update the current configuration
                                     self.signal_current_configuration.emit(config)
@@ -1306,7 +1664,16 @@ class MultiPointWorker(QObject):
                                     elif self.liveController.trigger_mode == TriggerMode.HARDWARE:
                                         self.microcontroller.send_hardware_trigger(control_illumination=True,illumination_on_time_us=self.camera.exposure_time*1000)
                                     # read camera frame
+                                    old_pixel_format = self.camera.pixel_format
+                                    if config.pixel_format is not None:
+                                        if config.pixel_format != "" and config.pixel_format.lower() != "default":
+                                            self.camera.set_pixel_format(config.pixel_format)
+                                    
                                     image = self.camera.read_frame()
+
+                                    if config.pixel_format is not None:
+                                        if config.pixel_format != "" and config.pixel_format.lower() != "default":
+                                            self.camera.set_pixel_format(old_pixel_format)
                                     if image is None:
                                         print('self.camera.read_frame() returned None')
                                         continue
@@ -1342,6 +1709,9 @@ class MultiPointWorker(QObject):
                                             else:
                                                 image = cv2.cvtColor(image,cv2.COLOR_RGB2BGR)
                                         cv2.imwrite(saving_path,image)
+                                        
+                                    current_round_images[config.name] = np.copy(image)
+
                                     QApplication.processEvents()
                                 else:
                                     if self.usb_spectrometer != None:
@@ -1350,12 +1720,23 @@ class MultiPointWorker(QObject):
                                             self.spectrum_to_display.emit(data)
                                             saving_path = os.path.join(current_path, file_ID + '_' + str(config.name).replace(' ','_') + '_' + str(l) + '.csv')
                                             np.savetxt(saving_path,data,delimiter=',')
+                                
+                                
+                                if config.z_offset is not None: # undo Z offset
+                                                                # assume z_offset is in um
+                                    if config.z_offset != 0.0:
+                                        print("Moving back from Z offset "+str(config.z_offset))
+                                        self.navigationController.move_z(-config.z_offset/1000)
+                                        self.wait_till_operation_is_completed()
+                                        time.sleep(SCAN_STABILIZATION_TIME_MS_Z/1000)
 
+                                                            
                             # add the coordinate of the current location
-                            new_row = pd.DataFrame({'i':[i],'j':[self.NX-1-j],'k':[k],
+                            new_row = pd.DataFrame({'i':[self.NY-1-i if sgn_i == -1 else i],'j':[j if sgn_j == 1 else self.NX-1-j],'k':[k],
                                                     'x (mm)':[self.navigationController.x_pos_mm],
                                                     'y (mm)':[self.navigationController.y_pos_mm],
-                                                    'z (um)':[self.navigationController.z_pos_mm*1000]},
+                                                    'z (um)':[self.navigationController.z_pos_mm*1000],
+                                                    'time':datetime.now().strftime('%Y-%m-%d_%H-%M-%-S.%f')},
                                                     )
                             self.coordinates_pd = pd.concat([self.coordinates_pd, new_row], ignore_index=True)
 
@@ -1458,6 +1839,8 @@ class MultiPointWorker(QObject):
         # finished region scan
         self.coordinates_pd.to_csv(os.path.join(current_path,'coordinates.csv'),index=False,header=True)
         self.navigationController.enable_joystick_button_action = True
+        print(time.time())
+        print(time.time()-start)
 
 class MultiPointController(QObject):
 
@@ -1467,11 +1850,13 @@ class MultiPointController(QObject):
     spectrum_to_display = Signal(np.ndarray)
     signal_current_configuration = Signal(Configuration)
     signal_register_current_fov = Signal(float,float)
+    detection_stats = Signal(object)
 
     def __init__(self,camera,navigationController,liveController,autofocusController,configurationManager,usb_spectrometer=None,scanCoordinates=None,parent=None):
         QObject.__init__(self)
 
         self.camera = camera
+        self.processingHandler = ProcessingHandler()
         self.microcontroller = navigationController.microcontroller # to move to gui for transparency
         self.navigationController = navigationController
         self.liveController = liveController
@@ -1493,6 +1878,9 @@ class MultiPointController(QObject):
         self.deltat = 0
         self.do_autofocus = False
         self.do_reflection_af = False
+        self.gen_focus_map = False
+        self.focus_map_storage = []
+        self.already_using_fmap = False
         self.crop_width = Acquisition.CROP_WIDTH
         self.crop_height = Acquisition.CROP_HEIGHT
         self.display_resolution_scaling = Acquisition.IMAGE_DISPLAY_SCALING_FACTOR
@@ -1504,6 +1892,12 @@ class MultiPointController(QObject):
         self.scanCoordinates = scanCoordinates
         self.parent = parent
 
+        self.old_images_per_page = 1
+        try:
+            if self.parent is not None:
+                self.old_images_per_page = self.parent.dataHandler.n_images_per_page
+        except:
+            pass
         self.location_list = None # for flexible multipoint
 
     def set_NX(self,N):
@@ -1532,7 +1926,10 @@ class MultiPointController(QObject):
         self.do_autofocus = flag
     def set_reflection_af_flag(self,flag):
         self.do_reflection_af = flag
-
+    def set_gen_focus_map_flag(self, flag):
+        self.gen_focus_map = flag
+        if not flag:
+            self.autofocusController.set_focus_map_use(False)
     def set_crop(self,crop_width,height):
         self.crop_width = crop_width
         self.crop_height = crop_height
@@ -1546,8 +1943,27 @@ class MultiPointController(QObject):
         self.recording_start_time = time.time()
         # create a new folder
         os.mkdir(os.path.join(self.base_path,self.experiment_ID))
-        self.configurationManager.write_configuration(os.path.join(self.base_path,self.experiment_ID)+"/configurations.xml") # save the configuration for the experiment
+        configManagerThrowaway = ConfigurationManager(self.configurationManager.config_filename)
+        configManagerThrowaway.write_configuration_selected(self.selected_configurations,os.path.join(self.base_path,self.experiment_ID)+"/configurations.xml") # save the configuration for the experiment
         acquisition_parameters = {'dx(mm)':self.deltaX, 'Nx':self.NX, 'dy(mm)':self.deltaY, 'Ny':self.NY, 'dz(um)':self.deltaZ*1000,'Nz':self.NZ,'dt(s)':self.deltat,'Nt':self.Nt,'with AF':self.do_autofocus,'with reflection AF':self.do_reflection_af}
+        try: # write objective data if it is available
+            current_objective = self.parent.objectiveStore.current_objective
+            objective_info = self.parent.objectiveStore.objectives_dict.get(current_objective, {})
+            acquisition_parameters['objective'] = {}
+            for k in objective_info.keys():
+                acquisition_parameters['objective'][k]=objective_info[k]
+            acquisition_parameters['objective']['name']=current_objective
+        except:
+            try:
+                objective_info = OBJECTIVES[DEFAULT_OBJECTIVE]
+                acquisition_parameters['objective'] = {}
+                for k in objective_info.keys():
+                    acquisition_parameters['objective'][k] = objective_info[k]
+                acquisition_parameters['objective']['name']=DEFAULT_OBJECTIVE
+            except:
+                pass
+        acquisition_parameters['sensor_pixel_size_um'] = CAMERA_PIXEL_SIZE_UM[CAMERA_SENSOR]
+        acquisition_parameters['tube_lens_mm'] = TUBE_LENS_MM
         f = open(os.path.join(self.base_path,self.experiment_ID)+"/acquisition parameters.json","w")
         f.write(json.dumps(acquisition_parameters))
         f.close()
@@ -1568,6 +1984,8 @@ class MultiPointController(QObject):
             self.location_list = None
 
         self.abort_acqusition_requested = False
+
+        
 
         self.configuration_before_running_multipoint = self.liveController.currentConfiguration
         # stop live
@@ -1591,16 +2009,61 @@ class MultiPointController(QObject):
             else:
                 self.usb_spectrometer_was_streaming = False
 
+        if self.parent is not None:
+            try:
+                self.parent.imageDisplayTabs.setCurrentWidget(self.parent.imageArrayDisplayWindow.widget)
+            except:
+                pass
+            try:
+                self.parent.recordTabWidget.setCurrentWidget(self.parent.statsDisplayWidget)
+            except:
+                pass
+        
         # run the acquisition
         self.timestamp_acquisition_started = time.time()
         # create a QThread object
+        if self.gen_focus_map and not self.do_reflection_af:
+            print("Generating focus map for multipoint grid")
+            starting_x_mm = self.navigationController.x_pos_mm
+            starting_y_mm = self.navigationController.y_pos_mm
+            fmap_Nx = max(2,self.NX)
+            fmap_Ny = max(2,self.NY)
+            fmap_dx = self.deltaX
+            fmap_dy = self.deltaY
+            if abs(fmap_dx) < 0.1 and fmap_dx != 0.0:
+                fmap_dx = 0.1*fmap_dx/(abs(fmap_dx))
+            elif fmap_dx == 0.0:
+                fmap_dx = 0.1
+            if abs(fmap_dy) < 0.1 and fmap_dy != 0.0:
+                 fmap_dy = 0.1*fmap_dy/(abs(fmap_dy))
+            elif fmap_dy == 0.0:
+                fmap_dy = 0.1
+            try:
+                self.focus_map_storage = []
+                self.already_using_fmap = self.autofocusController.use_focus_map
+                for x,y,z in self.autofocusController.focus_map_coords:
+                    self.focus_map_storage.append((x,y,z))
+                coord1 = (starting_x_mm, starting_y_mm)
+                coord2 = (starting_x_mm+fmap_Nx*fmap_dx,starting_y_mm)
+                coord3 = (starting_x_mm,starting_y_mm+fmap_Ny*fmap_dy)
+                self.autofocusController.gen_focus_map(coord1, coord2, coord3)
+                self.autofocusController.set_focus_map_use(True)
+                self.navigationController.move_to(starting_x_mm, starting_y_mm)
+                self.navigationController.microcontroller.wait_till_operation_is_completed()
+            except ValueError:
+                print("Invalid coordinates for focus map, aborting.")
+                return
+
         self.thread = QThread()
         # create a worker object
+        self.processingHandler.start_processing()
+        self.processingHandler.start_uploading()
         self.multiPointWorker = MultiPointWorker(self)
         # move the worker to the thread
         self.multiPointWorker.moveToThread(self.thread)
         # connect signals and slots
         self.thread.started.connect(self.multiPointWorker.run)
+        self.multiPointWorker.signal_detection_stats.connect(self.slot_detection_stats)
         self.multiPointWorker.finished.connect(self._on_acquisition_completed)
         self.multiPointWorker.finished.connect(self.multiPointWorker.deleteLater)
         self.multiPointWorker.finished.connect(self.thread.quit)
@@ -1616,6 +2079,11 @@ class MultiPointController(QObject):
 
     def _on_acquisition_completed(self):
         # restore the previous selected mode
+        if self.gen_focus_map:
+            self.autofocusController.clear_focus_map()
+            for x,y,z in self.focus_map_storage:
+                self.autofocusController.focus_map_coords.append((x,y,z))
+            self.autofocusController.use_focus_map = self.already_using_fmap
         self.signal_current_configuration.emit(self.configuration_before_running_multipoint)
 
         # re-enable callback
@@ -1632,11 +2100,22 @@ class MultiPointController(QObject):
                 self.usb_spectrometer.resume_streaming()
         
         # emit the acquisition finished signal to enable the UI
+        self.processingHandler.end_processing()
+        if self.parent is not None:
+            try:
+                self.parent.dataHandler.set_number_of_images_per_page(self.old_images_per_page)
+                self.parent.dataHandler.sort('Sort by prediction score')
+                self.parent.dataHandler.signal_populate_page0.emit()
+            except:
+                pass
         self.acquisitionFinished.emit()
         QApplication.processEvents()
 
     def request_abort_aquisition(self):
         self.abort_acqusition_requested = True
+
+    def slot_detection_stats(self, stats):
+        self.detection_stats.emit(stats)
 
     def slot_image_to_display(self,image):
         self.image_to_display.emit(image)
@@ -2048,6 +2527,8 @@ class TrackingWorker(QObject):
 
 class ImageDisplayWindow(QMainWindow):
 
+    image_click_coordinates = Signal(int, int)
+
     def __init__(self, window_title='', draw_crosshairs = False, show_LUT=False, autoLevels=False):
         super().__init__()
         self.setWindowTitle(window_title)
@@ -2117,6 +2598,35 @@ class ImageDisplayWindow(QMainWindow):
         width = min(desktopWidget.height()*0.9,1000) #@@@TO MOVE@@@#
         height = width
         self.setFixedSize(int(width),int(height))
+        if self.show_LUT:
+            self.graphics_widget.view.getView().scene().sigMouseClicked.connect(self.mouse_clicked)
+        else:
+            self.graphics_widget.view.scene().sigMouseClicked.connect(self.mouse_clicked)
+        
+    def is_within_image(self, coordinates):
+        try:
+            image_width = self.graphics_widget.img.width()
+            image_height = self.graphics_widget.img.height()
+
+            return 0 <= coordinates.x() < image_width and 0 <= coordinates.y() < image_height
+        except:
+            return False
+
+    def mouse_clicked(self, evt):
+        try:
+            pos = evt.pos()
+            if self.show_LUT:
+                view_coord = self.graphics_widget.view.getView().mapSceneToView(pos)
+            else:
+                view_coord = self.graphics_widget.view.mapSceneToView(pos)
+            image_coord = self.graphics_widget.img.mapFromView(view_coord)
+        except:
+            return
+
+        if self.is_within_image(image_coord):
+            x_pixel_centered = int(image_coord.x() - self.graphics_widget.img.width()/2)
+            y_pixel_centered = int(image_coord.y() - self.graphics_widget.img.height()/2)
+            self.image_click_coordinates.emit(x_pixel_centered, y_pixel_centered) 
 
     def display_image(self,image):
         if ENABLE_TRACKING:
@@ -2317,26 +2827,29 @@ class ImageArrayDisplayWindow(QMainWindow):
         self.graphics_widget_1.view = self.graphics_widget_1.addViewBox()
         self.graphics_widget_1.view.setAspectLocked(True)
         self.graphics_widget_1.img = pg.ImageItem(border='w')
-        self.graphics_widget_1.view.addItem(self.graphics_widget_1.img)
+        self.graphics_widget_1.view.addItem(self.graphics_widget_1.img) 
+        self.graphics_widget_1.view.invertY()
 
         self.graphics_widget_2 = pg.GraphicsLayoutWidget()
         self.graphics_widget_2.view = self.graphics_widget_2.addViewBox()
         self.graphics_widget_2.view.setAspectLocked(True)
         self.graphics_widget_2.img = pg.ImageItem(border='w')
         self.graphics_widget_2.view.addItem(self.graphics_widget_2.img)
+        self.graphics_widget_2.view.invertY()
 
         self.graphics_widget_3 = pg.GraphicsLayoutWidget()
         self.graphics_widget_3.view = self.graphics_widget_3.addViewBox()
         self.graphics_widget_3.view.setAspectLocked(True)
         self.graphics_widget_3.img = pg.ImageItem(border='w')
         self.graphics_widget_3.view.addItem(self.graphics_widget_3.img)
+        self.graphics_widget_3.view.invertY()
 
         self.graphics_widget_4 = pg.GraphicsLayoutWidget()
         self.graphics_widget_4.view = self.graphics_widget_4.addViewBox()
         self.graphics_widget_4.view.setAspectLocked(True)
         self.graphics_widget_4.img = pg.ImageItem(border='w')
         self.graphics_widget_4.view.addItem(self.graphics_widget_4.img)
-
+        self.graphics_widget_4.view.invertY()
         ## Layout
         layout = QGridLayout()
         layout.addWidget(self.graphics_widget_1, 0, 0)
@@ -2363,7 +2876,7 @@ class ImageArrayDisplayWindow(QMainWindow):
             self.graphics_widget_4.img.setImage(image,autoLevels=False)
 
 class ConfigurationManager(QObject):
-    def __init__(self,filename=str(Path.home()) + "/configurations_default.xml"):
+    def __init__(self,filename="channel_configurations.xml"):
         QObject.__init__(self)
         self.config_filename = filename
         self.configurations = []
@@ -2391,14 +2904,33 @@ class ConfigurationManager(QObject):
                     analog_gain = float(mode.get('AnalogGain')),
                     illumination_source = int(mode.get('IlluminationSource')),
                     illumination_intensity = float(mode.get('IlluminationIntensity')),
-                    camera_sn = mode.get('CameraSN'))
+                    camera_sn = mode.get('CameraSN'),
+                    z_offset = float(mode.get('ZOffset')),
+                    pixel_format = mode.get('PixelFormat'),
+                    _pixel_format_options = mode.get('_PixelFormat_options')
+                )
             )
 
     def update_configuration(self,configuration_id,attribute_name,new_value):
-        list = self.config_xml_tree_root.xpath("//mode[contains(@ID," + "'" + str(configuration_id) + "')]")
-        mode_to_update = list[0]
+        conf_list = self.config_xml_tree_root.xpath("//mode[contains(@ID," + "'" + str(configuration_id) + "')]")
+        mode_to_update = conf_list[0]
         mode_to_update.set(attribute_name,str(new_value))
         self.save_configurations()
+
+    def update_configuration_without_writing(self, configuration_id, attribute_name, new_value):
+        conf_list = self.config_xml_tree_root.xpath("//mode[contains(@ID," + "'" + str(configuration_id) + "')]")
+        mode_to_update = conf_list[0]
+        mode_to_update.set(attribute_name,str(new_value))
+
+    def write_configuration_selected(self,selected_configurations,filename): # to be only used with a throwaway instance
+                                                                             # of this class
+        for conf in self.configurations:
+            self.update_configuration_without_writing(conf.id, "Selected", 0)
+        for conf in selected_configurations:
+            self.update_configuration_without_writing(conf.id, "Selected", 1)
+        self.write_configuration(filename)
+        for conf in selected_configurations:
+            self.update_configuration_without_writing(conf.id, "Selected", 0)
 
 class PlateReaderNavigationController(QObject):
 
@@ -2553,7 +3085,7 @@ class LaserAutofocusController(QObject):
     image_to_display = Signal(np.ndarray)
     signal_displacement_um = Signal(float)
 
-    def __init__(self,microcontroller,camera,liveController,navigationController,has_two_interfaces=True,use_glass_top=True):
+    def __init__(self,microcontroller,camera,liveController,navigationController,has_two_interfaces=True,use_glass_top=True, look_for_cache=True):
         QObject.__init__(self)
         self.microcontroller = microcontroller
         self.camera = camera
@@ -2571,8 +3103,36 @@ class LaserAutofocusController(QObject):
         self.has_two_interfaces = has_two_interfaces # e.g. air-glass and glass water, set to false when (1) using oil immersion (2) using 1 mm thick slide (3) using metal coated slide or Si wafer
         self.use_glass_top = use_glass_top
         self.spot_spacing_pixels = None # spacing between the spots from the two interfaces (unit: pixel)
+        
+        self.look_for_cache = look_for_cache
 
-    def initialize_manual(self, x_offset, y_offset, width, height, pixel_to_um, x_reference):
+        self.image = None # for saving the focus camera image for debugging when centroid cannot be found
+
+        if look_for_cache:
+            cache_path = "cache/laser_af_reference_plane.txt"
+            try:
+                with open(cache_path, "r") as cache_file:
+                    for line in cache_file:
+                        value_list = line.split(",")
+                        x_offset = float(value_list[0])
+                        y_offset = float(value_list[1])
+                        width = int(value_list[2])
+                        height = int(value_list[3])
+                        pixel_to_um = float(value_list[4])
+                        x_reference = float(value_list[5])
+                        self.initialize_manual(x_offset,y_offset,width,height,pixel_to_um,x_reference)
+                        break
+            except (FileNotFoundError, ValueError,IndexError) as e:
+                print("Unable to read laser AF state cache, exception below:")
+                print(e)
+                pass
+
+    def initialize_manual(self, x_offset, y_offset, width, height, pixel_to_um, x_reference, write_to_cache=True):
+        cache_string = ",".join([str(x_offset),str(y_offset), str(width),str(height), str(pixel_to_um), str(x_reference)])
+        if write_to_cache:
+            cache_path = Path("cache/laser_af_reference_plane.txt")
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(cache_string)
         # x_reference is relative to the full sensor
         self.pixel_to_um = pixel_to_um
         self.x_offset = int((x_offset//8)*8)
@@ -2648,6 +3208,35 @@ class LaserAutofocusController(QObject):
 
         # set reference
         self.x_reference = x1
+
+        if self.look_for_cache:
+            cache_path = "cache/laser_af_reference_plane.txt"
+            try:
+                x_offset = None
+                y_offset = None
+                width = None
+                height = None
+                pixel_to_um = None
+                x_reference = None
+                with open(cache_path, "r") as cache_file:
+                    for line in cache_file:
+                        value_list = line.split(",")
+                        x_offset = float(value_list[0])
+                        y_offset = float(value_list[1])
+                        width = int(value_list[2])
+                        height = int(value_list[3])
+                        pixel_to_um = self.pixel_to_um
+                        x_reference = self.x_reference+self.x_offset
+                        break
+                cache_string = ",".join([str(x_offset),str(y_offset), str(width),str(height), str(pixel_to_um), str(x_reference)])
+                cache_path = Path("cache/laser_af_reference_plane.txt")
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(cache_string)
+            except (FileNotFoundError, ValueError,IndexError) as e:
+                print("Unable to read laser AF state cache, exception below:")
+                print(e)
+                pass
+
 
     def measure_displacement(self):
         # turn on the laser
@@ -2755,6 +3344,7 @@ class LaserAutofocusController(QObject):
                 pass # to edit
             # read camera frame
             image = self.camera.read_frame()
+            self.image = image
             # optionally display the image
             if LASER_AF_DISPLAY_SPOT_IMAGE:
                 self.image_to_display.emit(image)
