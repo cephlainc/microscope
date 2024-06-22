@@ -1,5 +1,6 @@
 # set QT_API environment variable
 import os 
+import sys
 os.environ["QT_API"] = "pyqt5"
 import qtpy
 
@@ -27,21 +28,6 @@ class OctopiGUI(QMainWindow):
 
     def __init__(self, is_simulation = False, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-        # load window
-        if ENABLE_TRACKING:
-            self.imageDisplayWindow = core.ImageDisplayWindow(draw_crosshairs=True)
-            self.imageDisplayWindow.show_ROI_selector()
-        else:
-            self.imageDisplayWindow = core.ImageDisplayWindow(draw_crosshairs=True)
-        self.imageArrayDisplayWindow = core.ImageArrayDisplayWindow() 
-        # self.imageDisplayWindow.show()
-        # self.imageArrayDisplayWindow.show()
-
-        # image display windows
-        self.imageDisplayTabs = QTabWidget()
-        self.imageDisplayTabs.addTab(self.imageDisplayWindow.widget, "Live View")
-        self.imageDisplayTabs.addTab(self.imageArrayDisplayWindow.widget, "Multichannel Acquisition")
 
         # load objects
         if is_simulation:
@@ -91,8 +77,26 @@ class OctopiGUI(QMainWindow):
             time.sleep(0.005)
             if time.time() - t0 > 10:
                 print('z homing timeout, the program will exit')
-                exit()
+                sys.exit(1)
         print('objective retracted')
+
+        # set encoder arguments
+        # set axis pid control enable
+        # only ENABLE_PID_X and HAS_ENCODER_X are both enable, can be enable to PID
+        if HAS_ENCODER_X == True:
+            self.navigationController.set_axis_PID_arguments(0, PID_P_X, PID_I_X, PID_D_X)
+            self.navigationController.configure_encoder(0, (SCREW_PITCH_X_MM * 1000) / ENCODER_RESOLUTION_UM_X, ENCODER_FLIP_DIR_X)
+            self.navigationController.set_pid_control_enable(0, ENABLE_PID_X)
+        if HAS_ENCODER_Y == True:
+            self.navigationController.set_axis_PID_arguments(1, PID_P_Y, PID_I_Y, PID_D_Y)
+            self.navigationController.configure_encoder(1, (SCREW_PITCH_Y_MM * 1000) / ENCODER_RESOLUTION_UM_Y, ENCODER_FLIP_DIR_Y)
+            self.navigationController.set_pid_control_enable(1, ENABLE_PID_Y)
+        if HAS_ENCODER_Z == True:
+            self.navigationController.set_axis_PID_arguments(2, PID_P_Z, PID_I_Z, PID_D_Z)
+            self.navigationController.configure_encoder(2, (SCREW_PITCH_Z_MM * 1000) / ENCODER_RESOLUTION_UM_Z, ENCODER_FLIP_DIR_Z)
+            self.navigationController.set_pid_control_enable(2, ENABLE_PID_Z)
+
+        time.sleep(0.5)
 
         # homing, set zero and set software limit
         self.navigationController.set_x_limit_pos_mm(100)
@@ -109,15 +113,28 @@ class OctopiGUI(QMainWindow):
         self.navigationController.set_y_limit_pos_mm(SOFTWARE_POS_LIMIT.Y_POSITIVE)
         self.navigationController.set_y_limit_neg_mm(SOFTWARE_POS_LIMIT.Y_NEGATIVE)
 
-        # raise the objective
-        self.navigationController.move_z(DEFAULT_Z_POS_MM)
-        # wait for the operation to finish
-        t0 = time.time() 
-        while self.microcontroller.is_busy():
-            time.sleep(0.005)
-            if time.time() - t0 > 5:
-                print('z return timeout, the program will exit')
-                exit()
+        # set piezo arguments
+        if ENABLE_OBJECTIVE_PIEZO is True:
+            if OBJECTIVE_PIEZO_CONTROL_VOLTAGE_RANGE == 5:
+                OUTPUT_GAINS.CHANNEL7_GAIN = True
+            else:
+                OUTPUT_GAINS.CHANNEL7_GAIN = False
+
+        # set output's gains
+        div = 1 if OUTPUT_GAINS.REFDIV is True else 0
+        gains  = OUTPUT_GAINS.CHANNEL0_GAIN << 0 
+        gains += OUTPUT_GAINS.CHANNEL1_GAIN << 1 
+        gains += OUTPUT_GAINS.CHANNEL2_GAIN << 2 
+        gains += OUTPUT_GAINS.CHANNEL3_GAIN << 3 
+        gains += OUTPUT_GAINS.CHANNEL4_GAIN << 4 
+        gains += OUTPUT_GAINS.CHANNEL5_GAIN << 5 
+        gains += OUTPUT_GAINS.CHANNEL6_GAIN << 6 
+        gains += OUTPUT_GAINS.CHANNEL7_GAIN << 7 
+        self.microcontroller.configure_dac80508_refdiv_and_gain(div, gains)
+
+        # set illumination intensity factor
+        global ILLUMINATION_INTENSITY_FACTOR
+        self.microcontroller.set_dac80508_scaling_factor_for_illumination(ILLUMINATION_INTENSITY_FACTOR)
 
         # set software limit
         self.navigationController.set_x_limit_pos_mm(SOFTWARE_POS_LIMIT.X_POSITIVE)
@@ -152,6 +169,33 @@ class OctopiGUI(QMainWindow):
         #self.recordTabWidget.addTab(self.recordingControlWidget, "Simple Recording")
         self.recordTabWidget.addTab(self.multiPointWidget, "Multipoint Acquisition")
         self.recordTabWidget.addTab(self.focusMapWidget, "Contrast Focus Map")
+
+        self.imageDisplayTabs = QTabWidget()
+        if USE_NAPARI_FOR_LIVE_VIEW:
+            self.napariLiveWidget = widgets.NapariLiveWidget(self.configurationManager, self.liveControlWidget)
+            self.imageDisplayTabs.addTab(self.napariLiveWidget, "Live View")
+        else:
+            if ENABLE_TRACKING:
+                self.imageDisplayWindow = core.ImageDisplayWindow(draw_crosshairs=True)
+                self.imageDisplayWindow.show_ROI_selector()
+            else:
+                self.imageDisplayWindow = core.ImageDisplayWindow(draw_crosshairs=True)
+            self.imageDisplayTabs.addTab(self.imageDisplayWindow.widget, "Live View")
+
+        if USE_NAPARI_FOR_MULTIPOINT:
+            self.napariMultiChannelWidget = widgets.NapariMultiChannelWidget(self.configurationManager)
+            self.imageDisplayTabs.addTab(self.napariMultiChannelWidget, "Multichannel Acquisition")
+        else:
+            self.imageArrayDisplayWindow = core.ImageArrayDisplayWindow()
+            self.imageDisplayTabs.addTab(self.imageArrayDisplayWindow.widget, "Multichannel Acquisition")
+
+        if SHOW_TILED_PREVIEW:
+            if USE_NAPARI_FOR_TILED_DISPLAY:
+                self.napariTiledDisplayWidget = widgets.NapariTiledDisplayWidget(self.configurationManager)
+                self.imageDisplayTabs.addTab(self.napariTiledDisplayWidget, "Tiled Preview")
+            else:
+                self.imageDisplayWindow_scan_preview = core.ImageDisplayWindow(draw_crosshairs=True)
+                self.imageDisplayTabs.addTab(self.imageDisplayWindow_scan_preview.widget, "Tiled Preview")
 
         # layout widgets
         layout = QVBoxLayout() #layout = QStackedLayout()
@@ -205,10 +249,8 @@ class OctopiGUI(QMainWindow):
 
         # make connections
         self.streamHandler.signal_new_frame_received.connect(self.liveController.on_new_frame)
-        self.streamHandler.image_to_display.connect(self.imageDisplay.enqueue)
         self.streamHandler.packet_image_to_write.connect(self.imageSaver.enqueue)
         # self.streamHandler.packet_image_for_tracking.connect(self.trackingController.on_new_frame)
-        self.imageDisplay.image_to_display.connect(self.imageDisplayWindow.display_image) # may connect streamHandler directly to imageDisplayWindow
         self.navigationController.xPos.connect(lambda x:self.navigationWidget.label_Xpos.setText("{:.2f}".format(x)))
         self.navigationController.yPos.connect(lambda x:self.navigationWidget.label_Ypos.setText("{:.2f}".format(x)))
         self.navigationController.zPos.connect(lambda x:self.navigationWidget.label_Zpos.setText("{:.2f}".format(x)))
@@ -216,10 +258,48 @@ class OctopiGUI(QMainWindow):
             self.navigationController.signal_joystick_button_pressed.connect(self.trackingControlWidget.slot_joystick_button_pressed)
         else:
             self.navigationController.signal_joystick_button_pressed.connect(self.autofocusController.autofocus)
-        self.autofocusController.image_to_display.connect(self.imageDisplayWindow.display_image)
-        self.multipointController.image_to_display.connect(self.imageDisplayWindow.display_image)
         self.multipointController.signal_current_configuration.connect(self.liveControlWidget.set_microscope_mode)
-        self.multipointController.image_to_display_multi.connect(self.imageArrayDisplayWindow.display_image)
+        self.multiPointWidget.signal_acquisition_started.connect(self.navigationWidget.toggle_navigation_controls)
+
+        if USE_NAPARI_FOR_LIVE_VIEW:
+            self.autofocusController.image_to_display.connect(lambda image: self.napariLiveWidget.updateLiveLayer(image, from_autofocus=True))
+            self.streamHandler.image_to_display.connect(lambda image: self.napariLiveWidget.updateLiveLayer(image, from_autofocus=False))
+            self.multipointController.image_to_display.connect(lambda image: self.napariLiveWidget.updateLiveLayer(image, from_autofocus=False))
+            self.napariLiveWidget.signal_coordinates_clicked.connect(self.navigationController.move_from_click)
+        else:
+            self.streamHandler.image_to_display.connect(self.imageDisplay.enqueue)
+            self.autofocusController.image_to_display.connect(self.imageDisplayWindow.display_image)
+            self.multipointController.image_to_display.connect(self.imageDisplayWindow.display_image)
+            self.imageDisplay.image_to_display.connect(self.imageDisplayWindow.display_image)
+            self.imageDisplayWindow.image_click_coordinates.connect(self.navigationController.move_from_click)
+
+        if USE_NAPARI_FOR_MULTIPOINT:
+            self.multiPointWidget.signal_acquisition_channels.connect(self.napariMultiChannelWidget.initChannels)
+            self.multiPointWidget.signal_acquisition_shape.connect(self.napariMultiChannelWidget.initLayersShape)
+            self.multipointController.napari_layers_init.connect(self.napariMultiChannelWidget.initLayers)
+            self.multipointController.napari_layers_update.connect(self.napariMultiChannelWidget.updateLayers)
+            if USE_NAPARI_FOR_LIVE_VIEW:
+                self.napariMultiChannelWidget.signal_layer_contrast_limits.connect(self.napariLiveWidget.saveContrastLimits)
+                self.napariLiveWidget.signal_layer_contrast_limits.connect(self.napariMultiChannelWidget.saveContrastLimits)
+        else:
+            self.multipointController.image_to_display_multi.connect(self.imageArrayDisplayWindow.display_image)
+
+        if SHOW_TILED_PREVIEW:
+            if USE_NAPARI_FOR_TILED_DISPLAY:
+                self.multiPointWidget.signal_acquisition_channels.connect(self.napariTiledDisplayWidget.initChannels)
+                self.multiPointWidget.signal_acquisition_shape.connect(self.napariTiledDisplayWidget.initLayersShape)
+                self.multipointController.napari_layers_init.connect(self.napariTiledDisplayWidget.initLayers)
+                self.multipointController.napari_layers_update.connect(self.napariTiledDisplayWidget.updateLayers)
+                self.napariTiledDisplayWidget.signal_coordinates_clicked.connect(self.navigationController.scan_preview_move_from_click)
+                if USE_NAPARI_FOR_LIVE_VIEW:
+                    self.napariTiledDisplayWidget.signal_layer_contrast_limits.connect(self.napariLiveWidget.saveContrastLimits)
+                    self.napariLiveWidget.signal_layer_contrast_limits.connect(self.napariTiledDisplayWidget.saveContrastLimits)
+                if USE_NAPARI_FOR_MULTIPOINT:
+                    self.napariTiledDisplayWidget.signal_layer_contrast_limits.connect(self.napariMultiChannelWidget.saveContrastLimits)
+                    self.napariMultiChannelWidget.signal_layer_contrast_limits.connect(self.napariTiledDisplayWidget.saveContrastLimits)
+            else:
+                self.multipointController.image_to_display_tiled_preview.connect(self.imageDisplayWindow_scan_preview.display_image)
+                self.imageDisplayWindow_scan_preview.image_click_coordinates.connect(self.navigationController.scan_preview_move_from_click)
 
         self.liveControlWidget.signal_newExposureTime.connect(self.cameraSettingWidget.set_exposure_time)
         self.liveControlWidget.signal_newAnalogGain.connect(self.cameraSettingWidget.set_analog_gain)
@@ -233,9 +313,6 @@ class OctopiGUI(QMainWindow):
 
         self.navigationController.xyPos.connect(self.navigationViewer.update_current_location)
         self.multipointController.signal_register_current_fov.connect(self.navigationViewer.register_fov)
-        
-        self.imageDisplayWindow.image_click_coordinates.connect(self.navigationController.move_from_click)
-
 
         self.navigationController.move_to_cached_position()
 
@@ -244,6 +321,8 @@ class OctopiGUI(QMainWindow):
         event.accept()
         # self.softwareTriggerGenerator.stop() @@@ => 
         self.navigationController.home()
+        self.navigationController.turnoff_axis_pid_control()
+
         self.liveController.stop_live()
         self.camera.close()
         self.imageSaver.close()

@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import numpy as np
 from pathlib import Path
@@ -117,6 +118,8 @@ class CMD_SET:
     SET_ILLUMINATION_LED_MATRIX = 13
     ACK_JOYSTICK_BUTTON_PRESSED = 14
     ANALOG_WRITE_ONBOARD_DAC = 15
+    SET_DAC80508_REFDIV_GAIN = 16
+    SET_ILLUMINATION_INTENSITY_FACTOR = 17
     MOVETO_X = 6
     MOVETO_Y = 7
     MOVETO_Z = 8
@@ -129,6 +132,8 @@ class CMD_SET:
     CONFIGURE_STAGE_PID = 25
     ENABLE_STAGE_PID = 26
     DISABLE_STAGE_PID = 27
+    SET_HOME_SAFETY_MERGIN = 28
+    SET_PID_ARGUMENTS = 29
     SEND_HARDWARE_TRIGGER = 30
     SET_STROBE_DELAY = 31
     SET_PIN_LEVEL = 41
@@ -281,6 +286,39 @@ MAX_ACCELERATION_X_mm = 500
 MAX_ACCELERATION_Y_mm = 500
 MAX_ACCELERATION_Z_mm = 20
 
+# config encoder arguments
+HAS_ENCODER_X = False
+HAS_ENCODER_Y = False
+HAS_ENCODER_Z = False
+
+# enable PID control
+ENABLE_PID_X  = False
+ENABLE_PID_Y  = False
+ENABLE_PID_Z  = False
+
+# PID arguments
+PID_P_X = int(1<<12)
+PID_I_X = int(0)
+PID_D_X = int(0)
+
+PID_P_Y = int(1<<12)
+PID_I_Y = int(0)
+PID_D_Y = int(0)
+
+PID_P_Z = int(1<<12)
+PID_I_Z = int(0)
+PID_D_Z = int(1)
+
+# flip direction True or False
+ENCODER_FLIP_DIR_X = True
+ENCODER_FLIP_DIR_Y = True
+ENCODER_FLIP_DIR_Z = True
+
+# distance for each count (um)
+ENCODER_RESOLUTION_UM_X = 0.05
+ENCODER_RESOLUTION_UM_Y = 0.05
+ENCODER_RESOLUTION_UM_Z = 0.1
+
 # end of actuator specific configurations
 
 SCAN_STABILIZATION_TIME_MS_X = 160
@@ -351,6 +389,17 @@ class SLIDE_POSITION:
     SCANNING_X_MM = 3
     SCANNING_Y_MM = 3
 
+class OUTPUT_GAINS:
+    REFDIV = False
+    CHANNEL0_GAIN = False
+    CHANNEL1_GAIN = False
+    CHANNEL2_GAIN = False
+    CHANNEL3_GAIN = False
+    CHANNEL4_GAIN = False
+    CHANNEL5_GAIN = False
+    CHANNEL6_GAIN = False
+    CHANNEL7_GAIN = True
+
 SLIDE_POTISION_SWITCHING_TIMEOUT_LIMIT_S = 10
 SLIDE_POTISION_SWITCHING_HOME_EVERYTIME = False
 
@@ -360,6 +409,7 @@ class SOFTWARE_POS_LIMIT:
     Y_POSITIVE = 56
     Y_NEGATIVE = -0.5
     Z_POSITIVE = 6
+    Z_NEGATIVE = 0.05
 
 SHOW_AUTOLEVEL_BTN = False
 AUTOLEVEL_DEFAULT_SETTING = False
@@ -380,17 +430,13 @@ CAMERA_SN = {'ch 1':'SN1','ch 2': 'SN2'} # for multiple cameras, to be overwritt
 
 ENABLE_STROBE_OUTPUT = False
 
-Z_STACKING_CONFIG = 'FROM CENTER' # 'FROM BOTTOM', 'FROM TOP'
+Z_STACKING_CONFIG = 'FROM BOTTOM' # 'FROM BOTTOM', 'FROM TOP'
 
 # plate format
 WELLPLATE_FORMAT = 384
 
 # for 384 well plate
-X_MM_384_WELLPLATE_UPPERLEFT = 0
-Y_MM_384_WELLPLATE_UPPERLEFT = 0
 DEFAULT_Z_POS_MM = 2
-X_ORIGIN_384_WELLPLATE_PIXEL = 177 # upper left of B2
-Y_ORIGIN_384_WELLPLATE_PIXEL = 141 # upper left of B2
 NUMBER_OF_SKIP_384 = 1
 A1_X_MM_384_WELLPLATE = 12.05
 A1_Y_MM_384_WELLPLATE = 9.05
@@ -452,16 +498,100 @@ ENABLE_SPINNING_DISK_CONFOCAL=False
 
 INVERTED_OBJECTIVE = False
 
+ILLUMINATION_INTENSITY_FACTOR = 0.6
+
 CAMERA_TYPE="Default"
 
 FOCUS_CAMERA_TYPE="Default"
 
-INVERTED_OBJECTIVE = False
+# Spinning disk confocal integration
+ENABLE_SPINNING_DISK_CONFOCAL = False
+USE_LDI_SERIAL_CONTROL = False
+
+XLIGHT_EMISSION_FILTER_MAPPING = {405:1,470:2,555:3,640:4,730:5}
+XLIGHT_SERIAL_NUMBER = "B00031BE"
+XLIGHT_SLEEP_TIME_FOR_WHEEL = 0.25
+XLIGHT_VALIDATE_WHEEL_POS = False
+
+# Confocal.nl NL5 integration
+ENABLE_NL5 = False
+ENABLE_CELLX = False
+CELLX_SN = None
+CELLX_MODULATION = 'EXT Digital'
+NL5_USE_AOUT = False
+NL5_USE_DOUT = True
+NL5_TRIGGER_PIN = 2
+NL5_WAVENLENGTH_MAP = {
+    405: 1,
+    470: 2, 488: 2,
+    545: 3, 555: 3, 561: 3,
+    637: 4, 638: 4, 640: 4
+}
+
+# Laser AF characterization mode
+LASER_AF_CHARACTERIZATION_MODE=False
+
+# Napari integration
+USE_NAPARI_FOR_LIVE_VIEW = False
+USE_NAPARI_FOR_MULTIPOINT = True
+USE_NAPARI_FOR_TILED_DISPLAY = True
+
+# Controller SN (needed when using multiple teensy-based connections)
+CONTROLLER_SN = None
+
+# Sci microscopy
+SUPPORT_SCIMICROSCOPY_LED_ARRAY = False
+SCIMICROSCOPY_LED_ARRAY_SN = None
+SCIMICROSCOPY_LED_ARRAY_DISTANCE = 50
+SCIMICROSCOPY_LED_ARRAY_DEFAULT_NA = 0.8
+SCIMICROSCOPY_LED_ARRAY_DEFAULT_COLOR = [1,1,1]
+SCIMICROSCOPY_LED_ARRAY_TURN_ON_DELAY = 0.03 # time to wait before trigger the camera (in seconds)
+
+# Tiled preview
+SHOW_TILED_PREVIEW = True
+PRVIEW_DOWNSAMPLE_FACTOR = 5
+
+# Stitcher
+ENABLE_STITCHER = False
+IS_HCS = True
+FULL_REGISTRATION = False
+STITCH_COMPLETE_ACQUISITION = False
+CHANNEL_COLORS_MAP = {
+    '405':      {'hex': 0x3300FF, 'name': 'blue'},
+    '488':      {'hex': 0x1FFF00, 'name': 'green'},
+    '561':      {'hex': 0xFFCF00, 'name': 'yellow'},
+    '638':      {'hex': 0xFF0000, 'name': 'red'},
+    '730':      {'hex': 0x770000, 'name': 'dark red'},
+    'R':        {'hex': 0xFF0000, 'name': 'red'},
+    'G':        {'hex': 0x1FFF00, 'name': 'green'},
+    'B':        {'hex': 0x3300FF, 'name': 'blue'}
+}
+
+# Emission filter wheel
+USE_ZABER_EMISSION_FILTER_WHEEL = False
+# need redefine it with real USB device serial number
+FILTER_CONTROLLER_SERIAL_NUMBER = 'A10NG007' 
 
 ##########################################################
 #### start of loading machine specific configurations ####
 ##########################################################
 CACHED_CONFIG_FILE_PATH = None
+
+# Piezo configuration items
+ENABLE_OBJECTIVE_PIEZO = True
+# the value of OBJECTIVE_PIEZO_CONTROL_VOLTAGE_RANGE is 2.5 or 5
+OBJECTIVE_PIEZO_CONTROL_VOLTAGE_RANGE = 5
+OBJECTIVE_PIEZO_RANGE_UM = 300
+OBJECTIVE_PIEZO_HOME_UM = 20
+
+MULTIPOINT_USE_PIEZO_FOR_ZSTACKS = True
+MULTIPOINT_PIEZO_DELAY_MS = 20
+MULTIPOINT_PIEZO_UPDATE_DISPLAY = True
+
+AWB_RATIOS_R = 1.375
+AWB_RATIOS_G = 1
+AWB_RATIOS_B = 1.4141
+
 try:
     with open("cache/config_file_path.txt", 'r') as file:
         for line in file:
@@ -478,7 +608,7 @@ if config_files:
             config_files = [CACHED_CONFIG_FILE_PATH]
         else:
             print('multiple machine configuration files found, the program will exit')
-            exit()
+            sys.exit(1)
     print('load machine-specific configuration')
     #exec(open(config_files[0]).read())
     cfp = ConfigParser()
@@ -514,15 +644,20 @@ else:
     if config_files:
         if len(config_files) > 1:
             print('multiple machine configuration files found, the program will exit')
-            exit()
+            sys.exit(1)
         print('load machine-specific configuration')
         exec(open(config_files[0]).read())
     else:
         print('machine-specific configuration not present, the program will exit')
-        exit()
+        sys.exit(1)
 ##########################################################
 ##### end of loading machine specific configurations #####
 ##########################################################
+
+# objective piezo
+if ENABLE_OBJECTIVE_PIEZO == False:
+    MULTIPOINT_USE_PIEZO_FOR_ZSTACKS = False
+
 # saving path
 if not (DEFAULT_SAVING_PATH.startswith(str(Path.home()))):
     DEFAULT_SAVING_PATH = str(Path.home())+"/"+DEFAULT_SAVING_PATH.strip("/")
@@ -532,6 +667,11 @@ X_HOME_SWITCH_POLARITY = LIMIT_SWITCH_POLARITY.X_HOME
 Y_HOME_SWITCH_POLARITY = LIMIT_SWITCH_POLARITY.Y_HOME
 Z_HOME_SWITCH_POLARITY = LIMIT_SWITCH_POLARITY.Z_HOME
 
+# home safety margin with (um) unit
+X_HOME_SAFETY_MARGIN_UM = 50
+Y_HOME_SAFETY_MARGIN_UM = 50
+Z_HOME_SAFETY_MARGIN_UM = 600 
+
 if ENABLE_TRACKING:
     DEFAULT_DISPLAY_CROP = Tracking.DEFAULT_DISPLAY_CROP
 
@@ -539,29 +679,47 @@ if WELLPLATE_FORMAT == 384:
     WELL_SIZE_MM = 3.3
     WELL_SPACING_MM = 4.5
     NUMBER_OF_SKIP = 1
-    A1_X_MM = 12.05
-    A1_Y_MM = 9.05
+    A1_X_MM = 12.05     # measured stage position - to update
+    A1_Y_MM = 9.05      # measured stage position - to update
+    A1_X_PIXEL = 144    # coordinate on the png
+    A1_Y_PIXEL = 108    # coordinate on the png
 elif WELLPLATE_FORMAT == 96:
     NUMBER_OF_SKIP = 0
     WELL_SIZE_MM = 6.21
     WELL_SPACING_MM = 9
-    A1_X_MM = 14.3
-    A1_Y_MM = 11.36
+    A1_X_MM = 14.3      # measured stage position - to update
+    A1_Y_MM = 11.36     # measured stage position - to update
+    A1_X_PIXEL = 171    # coordinate on the png
+    A1_Y_PIXEL = 138    # coordinate on the png
 elif WELLPLATE_FORMAT == 24:
     NUMBER_OF_SKIP = 0
     WELL_SIZE_MM = 15.54
     WELL_SPACING_MM = 19.3
-    A1_X_MM = 17.05
-    A1_Y_MM = 13.67
+    A1_X_MM = 17.05     # measured stage position - to update
+    A1_Y_MM = 13.67     # measured stage position - to update
+    A1_X_PIXEL = 144    # coordinate on the png - to update
+    A1_Y_PIXEL = 108    # coordinate on the png - to update
 elif WELLPLATE_FORMAT == 12:
     NUMBER_OF_SKIP = 0
     WELL_SIZE_MM = 22.05
     WELL_SPACING_MM = 26
-    A1_X_MM = 24.75
-    A1_Y_MM = 16.86
+    A1_X_MM = 24.75     # measured stage position - to update
+    A1_Y_MM = 16.86     # measured stage position - to update
+    A1_X_PIXEL = 297    # coordinate on the png
+    A1_Y_PIXEL = 209    # coordinate on the png
 elif WELLPLATE_FORMAT == 6:
     NUMBER_OF_SKIP = 0
     WELL_SIZE_MM = 34.94
     WELL_SPACING_MM = 39.2
-    A1_X_MM = 24.55
-    A1_Y_MM = 23.01
+    A1_X_MM = 24.55     # measured stage position - to update
+    A1_Y_MM = 23.01     # measured stage position - to update
+    A1_X_PIXEL = 297    # coordinate on the png - to update
+    A1_Y_PIXEL = 209    # coordinate on the png - to update
+elif WELLPLATE_FORMAT == 1536:
+    NUMBER_OF_SKIP = 0
+    WELL_SIZE_MM = 1.5
+    WELL_SPACING_MM = 2.25
+    A1_X_MM = 11.0      # measured stage position - to update
+    A1_Y_MM = 7.86      # measured stage position - to update
+    A1_X_PIXEL = 144    # coordinate on the png - to update
+    A1_Y_PIXEL = 108    # coordinate on the png - to update

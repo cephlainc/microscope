@@ -1,3 +1,4 @@
+import sys
 import argparse
 import cv2
 import time
@@ -8,6 +9,7 @@ from control._def import *
 import threading
 import control.toupcam as toupcam
 from control.toupcam_exceptions import hresult_checker
+
 
 def get_sn_by_model(model_name):
     try:
@@ -61,7 +63,7 @@ class Camera(object):
                 raw_image = np.frombuffer(self.buf, dtype='uint8')
             elif self.pixel_size_byte == 2:
                 raw_image = np.frombuffer(self.buf, dtype='uint16')
-            self.current_frame = raw_image.reshape(self.height,self.width)
+            self.current_frame = raw_image.reshape(self.Height,self.Width)
 
         # for debugging
         #print(self.current_frame.shape)
@@ -113,7 +115,7 @@ class Camera(object):
         self.GAIN_MAX = 40
         self.GAIN_MIN = 0
         self.GAIN_STEP = 1
-        self.EXPOSURE_TIME_MS_MIN = 0.01
+        self.EXPOSURE_TIME_MS_MIN = 0.1
         self.EXPOSURE_TIME_MS_MAX = 3600000
 
         self.ROI_offset_x = CAMERA_CONFIG.ROI_OFFSET_X_DEFAULT
@@ -229,11 +231,11 @@ class Camera(object):
                         self.camera.StartPullModeWithCallback(self._event_callback, self)
                     except toupcam.HRESULTException as ex:
                         print('failed to start camera, hr=0x{:x}'.format(ex.hr))
-                        exit()
+                        sys.exit(1)
                 self._toupcam_pullmode_started = True
             else:
                 print('failed to open camera')
-                exit()
+                sys.exit(1)
         else:
             print('no camera found')
 
@@ -332,7 +334,7 @@ class Camera(object):
             except toupcam.HRESULTException as ex:
                 print('failed to start camera, hr: '+hresult_checker(ex))
                 self.close()
-                exit()
+                sys.exit(1)
         print('  start streaming')
         self.is_streaming = True
 
@@ -349,9 +351,6 @@ class Camera(object):
             self.stop_streaming()
 
         self.pixel_format = pixel_format
-
-        if self._toupcam_pullmode_started:
-            self.camera.Stop()
 
         if self.data_format == 'RAW':
             if pixel_format == 'MONO8':
@@ -397,7 +396,7 @@ class Camera(object):
                 self.camera.put_Option(toupcam.TOUPCAM_OPTION_BITDEPTH,1)
                 self.camera.put_Option(toupcam.TOUPCAM_OPTION_RGB,1)
 
-        self._update_buffer_settings(self.Width, self.Height)
+        self._update_buffer_settings()
 
         if was_streaming:
             self.start_streaming()
@@ -447,18 +446,20 @@ class Camera(object):
                 print(f"Resolution ({width},{height}) not supported by camera")
             else:
                 print(f"Resolution cannot be set due to error: "+err_type)
-        self._update_buffer_settings(self.Width, self.Height)
+        self._update_buffer_settings()
         if was_streaming:
             self.start_streaming()
 
     def _update_buffer_settings(self):
         # resize the buffer
-        width, height = self.camera.get_Size()
-        self.width = width
-        self.height = height
+        xoffset, yoffset, width, height = self.camera.get_Roi()
+
+        self.Width = width
+        self.Height = height
+
         # calculate buffer size
         if (self.data_format == 'RGB') & (self.pixel_size_byte != 4):
-            bufsize = _TDIBWIDTHBYTES(self.width * self.pixel_size_byte * 8) * height
+            bufsize = _TDIBWIDTHBYTES(width * self.pixel_size_byte * 8) * height
         else:
             bufsize = width * self.pixel_size_byte * height
         print('image size: {} x {}, bufsize = {}'.format(width, height, bufsize))
@@ -504,7 +505,26 @@ class Camera(object):
         self.camera.put_Option(toupcam.TOUPCAM_OPTION_TRIGGER,2)
         self.frame_ID_offset_hardware_trigger = None
         self.trigger_mode = TriggerMode.HARDWARE
+
+        # select trigger source to GPIO0
+        try:
+            self.camera.IoControl(1, toupcam.TOUPCAM_IOCONTROLTYPE_SET_TRIGGERSOURCE, 1)
+        except toupcam.HRESULTException as ex:
+            error_type = hresult_checker(ex)
+            print("Unable to select trigger source: " + error_type)
+        # set GPIO1 to trigger wait
+        try:
+            self.camera.IoControl(3, toupcam.TOUPCAM_IOCONTROLTYPE_SET_OUTPUTMODE, 0)
+            self.camera.IoControl(3, toupcam.TOUPCAM_IOCONTROLTYPE_SET_OUTPUTINVERTER, 0)
+        except toupcam.HRESULTException as ex:
+            error_type = hresult_checker(ex)
+            print("Unable to set GPIO1 for trigger ready: " + error_type)
+
         # self.update_camera_exposure_time()
+
+    def set_trigger_width_mode(self):
+        self.camera.IoControl(1, toupcam.TOUPCAM_IOCONTROLTYPE_SET_PWMSOURCE, 1) # set PWM source to GPIO0
+        self.camera.IoControl(1, toupcam.TOUPCAM_IOCONTROLTYPE_SET_TRIGGERSOURCE, 4) # trigger source to PWM
 
     def set_gain_mode(self,mode):
         if mode == 'LCG':
@@ -539,13 +559,15 @@ class Camera(object):
         else:
             pass
 
-    def read_frame(self):
-        self.image_is_ready = False
-        # self.send_trigger()
+    def read_frame(self,reset_image_ready_flag=True):
+        # set reset_image_ready_flag to True when read_frame() is called immediately after triggering the acquisition
+        if reset_image_ready_flag:
+            self.image_is_ready = False
         timestamp_t0 = time.time()
         while (time.time() - timestamp_t0) <= (self.exposure_time/1000)*1.02 + 4:
             time.sleep(0.005)
             if self.image_is_ready:
+                self.image_is_ready = False
                 return self.current_frame
         print('read frame timed out')
         return None
@@ -662,7 +684,7 @@ class Camera(object):
             except toupcam.HRESULTException as ex:
                 err_type = hresult_checker(ex,'E_INVALIDARG')
                 print("ROI bounds invalid, not changing ROI.")
-            self._update_buffer_settings(self.Width, self.Height)
+            self._update_buffer_settings()
         if was_streaming:
             self.start_streaming()
 
@@ -725,7 +747,7 @@ class Camera_Simulation(object):
         self.GAIN_MAX = 40
         self.GAIN_MIN = 0
         self.GAIN_STEP = 1
-        self.EXPOSURE_TIME_MS_MIN = 0.01
+        self.EXPOSURE_TIME_MS_MIN = 0.1
         self.EXPOSURE_TIME_MS_MAX = 3600000
 
         self.trigger_mode = None
